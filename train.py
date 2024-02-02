@@ -24,7 +24,7 @@ from datetime import datetime
 from functools import partial
 
 import torch
-from model import Transformer, ModelArgs
+from model import Transformer, ModelArgs, MambaLM
 from torch.distributed import destroy_process_group, init_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
 
@@ -34,31 +34,34 @@ from export import model_export
 # -----------------------------------------------------------------------------
 # I/O
 out_dir = "out"
-eval_interval = 2000
+eval_interval = 200
 log_interval = 1
 eval_iters = 100
 eval_only = False  # if True, script exits right after the first eval
 always_save_checkpoint = False  # if True, always save a checkpoint after each eval
 init_from = "scratch"  # 'scratch' or 'resume'
+auto_resume = False # if True, resume training from the latest checkpoint if it exists
 # wandb logging
-wandb_log = False  # disabled by default
+wandb_log = True  # disabled by default
 wandb_project = "llamac"
 wandb_run_name = "run" + datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
 # data
-batch_size = 128  # if gradient_accumulation_steps > 1, this is the micro-batch size
-max_seq_len = 256
+data_path = "data"  # path to the data directory
+batch_size = 8  # if gradient_accumulation_steps > 1, this is the micro-batch size
+max_seq_len = 2048
 vocab_source = "llama2" # llama2|custom; use Lllama 2 vocab from Meta, or custom trained
 vocab_size = 32000 # the Llama 2 tokenizer has 32K tokens
 # model
-dim = 288
-n_layers = 6
-n_heads = 6
-n_kv_heads = 6
+dim = 768
+n_layers = 12
+n_heads = 12
+n_kv_heads = 12
 multiple_of = 32
 dropout = 0.0
+model_cls = "transformer"
 # adamw optimizer
-gradient_accumulation_steps = 4  # used to simulate larger batch sizes
-learning_rate = 5e-4  # max learning rate
+gradient_accumulation_steps = 32  # used to simulate larger batch sizes
+learning_rate = 6e-4  # max learning rate
 max_iters = 100000  # total number of training iterations
 weight_decay = 1e-1
 beta1 = 0.9
@@ -69,7 +72,7 @@ decay_lr = True  # whether to decay the learning rate
 warmup_iters = 1000  # how many steps to warm up for
 # system
 device = "cuda"  # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
-dtype = "bfloat16"  # float32|bfloat16|float16
+dtype = "float16"  # float32|bfloat16|float16
 compile = True  # use PyTorch 2.0 to compile the model to be faster
 # -----------------------------------------------------------------------------
 config_keys = [
@@ -80,6 +83,16 @@ config_keys = [
 exec(open("configurator.py").read())  # overrides from command line or config file
 config = {k: globals()[k] for k in config_keys}  # will be useful for logging
 # -----------------------------------------------------------------------------
+
+if model_cls == "transformer":
+    ModelCls = Transformer
+    ConfigCls = ModelArgs
+else:
+    from mamba_ssm.models.config_mamba import MambaConfig
+    from model import MambaLM
+    ModelCls = MambaLM
+    ConfigCls = MambaConfig
+    n_layers *= 2
 
 # fixing some hyperparams to sensible defaults
 lr_decay_iters = max_iters  # should be ~= max_iters per Chinchilla
@@ -137,6 +150,7 @@ iter_batches = partial(
     vocab_source=vocab_source,
     device=device,
     num_workers=0,
+    data_path=data_path,
 )
 
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
@@ -154,11 +168,21 @@ model_args = dict(
     max_seq_len=max_seq_len,
     dropout=dropout,
 )  # start with model_args from command line
+
+if auto_resume and os.path.exists(os.path.join(out_dir, "ckpt.pt")):
+    init_from = "resume"
 if init_from == "scratch":
     # init a new model from scratch
     print("Initializing a new model from scratch")
-    gptconf = ModelArgs(**model_args)
-    model = Transformer(gptconf)
+    if model_cls == "transformer":
+        gptconf = ConfigCls(**model_args)
+    else:
+        gptconf = ConfigCls(
+            d_model=dim,
+            n_layer=n_layers,
+            vocab_size=vocab_size,
+        )
+    model = ModelCls(gptconf)
 elif init_from == "resume":
     print(f"Resuming training from {out_dir}")
     # resume training from a checkpoint.
@@ -170,8 +194,15 @@ elif init_from == "resume":
     for k in ["dim", "n_layers", "n_heads", "n_kv_heads", "vocab_size", "multiple_of", "max_seq_len"]:
         model_args[k] = checkpoint_model_args[k]
     # create the model
-    gptconf = ModelArgs(**model_args)
-    model = Transformer(gptconf)
+    if model_cls == "transformer":
+        gptconf = ConfigCls(**model_args)
+    else:
+        gptconf = ConfigCls(
+            d_model=dim,
+            n_layer=n_layers,
+            vocab_size=vocab_size,
+        )
+    model = ModelCls(gptconf)
     state_dict = checkpoint["model"]
     # fix the keys of the state dictionary :(
     # honestly no idea how checkpoints sometimes get this prefix, have to debug more
@@ -187,6 +218,9 @@ model.to(device)
 # initialize a GradScaler. If enabled=False scaler is a no-op
 scaler = torch.cuda.amp.GradScaler(enabled=(dtype == "float16"))
 
+param_size = sum(p.numel() for p in model.parameters()) / 1e9
+print(f"model {model.__class__.__name__} has {param_size:0.3f}B parameters.")
+
 # optimizer
 optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
 if init_from == "resume" and "optimizer" in checkpoint:
@@ -194,7 +228,7 @@ if init_from == "resume" and "optimizer" in checkpoint:
 checkpoint = None  # free up memory
 
 # compile the model
-if compile:
+if model_cls == "transformer" and compile:
     print("compiling the model... (takes a ~minute)")
     unoptimized_model = model
     model = torch.compile(model)  # requires PyTorch 2.0
@@ -288,7 +322,6 @@ while True:
                 }
                 print(f"saving checkpoint to {out_dir}")
                 torch.save(checkpoint, os.path.join(out_dir, "ckpt.pt"))
-                model_export(raw_model, os.path.join(out_dir, "model.bin"), version=0)
     if iter_num == 0 and eval_only:
         break
 

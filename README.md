@@ -1,3 +1,25 @@
+# mamba v.s. llama on TinyStories
+
+The target of the repo is to make a minimal trainable mamba and compare it with llama structure on TinyStories dataset. This repo is heavily based on the original [llama2.c](https://github.com/karpathy/llama2.c), which is such a amazing project to be so clean and hackable.
+
+I'm training the 110M models both for mamba and llama, 0.5M tokens per batch, 6e-4 lr as mentioned in mamba paper, and the results are as follows:
+
+<p align="center">
+  <img src="assets/log.png"  height="300" alt="logs">
+</p>
+
+I also notice the mamba is ~23% slower than transformer for training on V100.
+
+For anyone who is interested in training models using this project:
+
++ A simple `auto_resume` is added.
++ `n_layer` will be doubled if model_cls is not "transformer".
++ read the configurator.py for setting hyperparameters via command line.
++ MFU currently is ignored for mamba model training.
++ The interface of generation funcs have not been unified yet.
+
+**The orignal README is following**
+
 ## llama2.c
 
 <p align="center">
