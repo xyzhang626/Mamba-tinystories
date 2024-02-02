@@ -84,7 +84,7 @@ exec(open("configurator.py").read())  # overrides from command line or config fi
 config = {k: globals()[k] for k in config_keys}  # will be useful for logging
 # -----------------------------------------------------------------------------
 
-if model_cls == "transformer":
+if "transformer" in model_cls:
     ModelCls = Transformer
     ConfigCls = ModelArgs
 else:
@@ -174,7 +174,7 @@ if auto_resume and os.path.exists(os.path.join(out_dir, "ckpt.pt")):
 if init_from == "scratch":
     # init a new model from scratch
     print("Initializing a new model from scratch")
-    if model_cls == "transformer":
+    if "transformer" in model_cls:
         gptconf = ConfigCls(**model_args)
     else:
         gptconf = ConfigCls(
@@ -194,7 +194,7 @@ elif init_from == "resume":
     for k in ["dim", "n_layers", "n_heads", "n_kv_heads", "vocab_size", "multiple_of", "max_seq_len"]:
         model_args[k] = checkpoint_model_args[k]
     # create the model
-    if model_cls == "transformer":
+    if "transformer" in model_cls:
         gptconf = ConfigCls(**model_args)
     else:
         gptconf = ConfigCls(
@@ -228,7 +228,7 @@ if init_from == "resume" and "optimizer" in checkpoint:
 checkpoint = None  # free up memory
 
 # compile the model
-if model_cls == "transformer" and compile:
+if "transformer" in model_cls and compile:
     print("compiling the model... (takes a ~minute)")
     unoptimized_model = model
     model = torch.compile(model)  # requires PyTorch 2.0
